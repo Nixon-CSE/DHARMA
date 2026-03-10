@@ -1,0 +1,8 @@
+{
+  "name": "DHARMA",
+  "description": "AI-powered justice documentation platform for victims of caste-based violence in India.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation"
+  ]
+}

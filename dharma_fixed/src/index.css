@@ -1,0 +1,31 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Mukta:wght@300;400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-serif: "DM Serif Display", serif;
+  --font-sans: "Mukta", sans-serif;
+  --color-navy: #0A0F1E;
+  --color-gold: #D4AF37;
+  --color-amber: #FFBF00;
+}
+
+@layer base {
+  body {
+    @apply bg-navy text-white font-sans;
+  }
+  h1, h2, h3, h4 {
+    @apply font-serif;
+  }
+}
+
+.glass {
+  @apply bg-white/5 backdrop-blur-lg border border-white/10;
+}
+
+.gold-glow {
+  box-shadow: 0 0 20px rgba(212, 175, 55, 0.2);
+}
+
+.red-glow {
+  box-shadow: 0 0 20px rgba(220, 38, 38, 0.4);
+}

@@ -30,9 +30,73 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import Orb from './components/Orb';
 import { TRANSLATIONS, type Language, type Case, type EvidenceFile } from './types';
+import Groq from 'groq-sdk';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+// quick heuristics to guess incident type / filed-against party from free text
+function inferFieldsFromText(text: string) {
+  const lower = text.toLowerCase();
+
+  // incident type keywords && corresponding selection values
+  const incidentMap: Array<{keyword: RegExp; value: string}> = [
+    { keyword: /assault|beat|hit|punch|kick|physical/i, value: 'Physical assault' },
+    { keyword: /verbal|slur|insult|abuse|casteist/i, value: 'Verbal abuse' },
+    { keyword: /property|damage|stole|theft|burned|destroy/i, value: 'Property damage' },
+    { keyword: /discriminat|denied entry|denied|excluded/i, value: 'Discrimination' },
+    { keyword: /sexual|molest|rape|harass/i, value: 'Sexual violence' },
+  ];
+
+  // party keywords
+  const partyMap: Array<{keyword: RegExp; value: string}> = [
+    { keyword: /police|officer|constable/i, value: 'Police officer' },
+    { keyword: /govt|government|official|minister|bureaucrat/i, value: 'Govt official' },
+    { keyword: /landlord|neighbor|person|individual|man|woman|boy|girl|farmer|villager/i, value: 'Individual' },
+    { keyword: /unknown|someone|somebody/i, value: 'Unknown' },
+  ];
+
+  let incidentType: string | undefined;
+  for (const item of incidentMap) {
+    if (item.keyword.test(lower)) {
+      incidentType = item.value;
+      break;
+    }
+  }
+
+  let filedAgainst: string | undefined;
+  for (const item of partyMap) {
+    if (item.keyword.test(lower)) {
+      filedAgainst = item.value;
+      break;
+    }
+  }
+
+  const result: { incidentType?: string; filedAgainst?: string } = {};
+  if (incidentType) result.incidentType = incidentType;
+  if (filedAgainst) result.filedAgainst = filedAgainst;
+  return result;
+}
+
+// send blob to Groq speech‑to‑text endpoint; returns transcription text
+async function transcribeWithGroq(blob: Blob, lang: Language) {
+  try {
+    const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const params: any = {
+      model: 'whisper-large-v3-turbo',
+      file: blob,
+    };
+    if (lang === 'HI') params.language = 'hi';
+    else if (lang === 'TA') params.language = 'ta';
+    // english is default when omitted
+
+    const resp = await client.audio.transcriptions.create(params);
+    return resp.text || '';
+  } catch (err) {
+    console.error('Groq transcription failed', err);
+    return '';
+  }
 }
 
 // --- Mock Data ---
@@ -95,10 +159,10 @@ export default function App() {
 
   useEffect(() => {
     const timer = setTimeout(() => setIsLoading(false), 1500);
-    const hasVisited = localStorage.getItem('nyaya_visited');
+    const hasVisited = localStorage.getItem('visited');
     if (!hasVisited) {
       setShowWalkthrough(true);
-      localStorage.setItem('nyaya_visited', 'true');
+      localStorage.setItem('visited', 'true');
     }
     return () => clearTimeout(timer);
   }, []);
@@ -107,6 +171,7 @@ export default function App() {
     setCurrentCase({
       id: `NYV-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`,
       date: new Date().toLocaleDateString(),
+      transcript: '', // start with empty transcription
       evidenceFiles: [],
       status: 'Draft' as Case['status']
     });
@@ -175,11 +240,11 @@ export default function App() {
 
           <div className="flex items-center gap-4">
             <button 
-              onClick={() => setLang(lang === 'EN' ? 'HI' : 'EN')}
+              onClick={() => setLang(lang === 'EN' ? 'HI' : lang === 'HI' ? 'TA' : 'EN')}
               className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 hover:bg-white/5 transition-colors text-sm"
             >
               <Globe size={16} className="text-gold" />
-              <span>{lang === 'EN' ? 'English' : 'हिंदी'}</span>
+              <span>{lang === 'EN' ? 'English' : lang === 'HI' ? 'हिंदी' : 'தமிழ்'}</span>
             </button>
             <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-red-600/10 border border-red-600/20 text-red-500 text-xs font-bold">
               <span className="animate-pulse">●</span>
@@ -192,7 +257,7 @@ export default function App() {
         <div className="flex-1 overflow-y-auto">
           <AnimatePresence mode="wait">
             {activeTab === 'home' && <HomeScreen key="home" t={t} onStart={handleStartNewCase} cases={cases} setActiveTab={setActiveTab} />}
-            {activeTab === 'record' && <RecordScreen key="record" t={t} currentCase={currentCase} setCurrentCase={setCurrentCase} onNext={() => setActiveTab('evidence')} />}
+            {activeTab === 'record' && <RecordScreen key="record" t={t} lang={lang} currentCase={currentCase} setCurrentCase={setCurrentCase} onNext={() => setActiveTab('evidence')} />}
             {activeTab === 'evidence' && <EvidenceScreen key="evidence" t={t} currentCase={currentCase} setCurrentCase={setCurrentCase} onNext={() => setActiveTab('complaint')} />}
             {activeTab === 'complaint' && <ComplaintScreen key="complaint" t={t} currentCase={currentCase} setCurrentCase={setCurrentCase} onSave={(c) => { setCases([c as Case, ...cases]); setActiveTab('myCases'); }} />}
             {activeTab === 'myCases' && <MyCasesScreen key="myCases" t={t} cases={cases} onNew={handleStartNewCase} />}
@@ -461,13 +526,51 @@ function StatusBadge({ status }: { status: Case['status'] }) {
   );
 }
 
-function RecordScreen({ t, currentCase, setCurrentCase, onNext }: { t: any, currentCase: any, setCurrentCase: any, onNext: () => void, key?: string }) {
+function RecordScreen({ t, lang, currentCase, setCurrentCase, onNext }: { t: any, lang: Language, currentCase: any, setCurrentCase: any, onNext: () => void, key?: string }) {
   const [isRecording, setIsRecording] = useState(false);
   const [timer, setTimer] = useState(0);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState<string>(currentCase.transcript || '');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
+  const recognitionRef = useRef<any>(null);
+
+  // whenever transcript changes, update the case object as well
+  useEffect(() => {
+    const inferred = inferFieldsFromText(transcript);
+    setCurrentCase(prev => ({ ...prev, transcript, ...inferred }));
+  }, [transcript]);
+
+  const startSpeechRecognition = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+    const rec = new SpeechRecognition();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = lang === 'HI' ? 'hi-IN' : lang === 'TA' ? 'ta-IN' : 'en-US';
+    rec.onresult = (e: any) => {
+      let final = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          final += e.results[i][0].transcript;
+        }
+      }
+      if (final) {
+        setTranscript(prev => prev + (prev ? ' ' : '') + final);
+      }
+    };
+    rec.onerror = (err: any) => console.error('Speech recognition error', err);
+    rec.start();
+    recognitionRef.current = rec;
+  };
+
+  const stopSpeechRecognition = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+    }
+  };
 
   const startRecording = async () => {
     try {
@@ -484,11 +587,22 @@ function RecordScreen({ t, currentCase, setCurrentCase, onNext }: { t: any, curr
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         const url = URL.createObjectURL(blob);
         setAudioUrl(url);
-        setCurrentCase({ ...currentCase, audioBlob: blob });
+        setCurrentCase(prev => ({ ...prev, audioBlob: blob, transcript }));
         stream.getTracks().forEach(track => track.stop());
+
+        // always attempt server transcription (covers Tamil & improves accuracy)
+        if (process.env.GROQ_API_KEY) {
+          transcribeWithGroq(blob, lang).then(text => {
+            if (text) {
+              setTranscript(text);
+              setCurrentCase(prev => ({ ...prev, transcript: text }));
+            }
+          });
+        }
       };
 
       mediaRecorder.start();
+      startSpeechRecognition();
       setIsRecording(true);
       timerRef.current = window.setInterval(() => {
         setTimer(prev => prev + 1);
@@ -559,9 +673,18 @@ function RecordScreen({ t, currentCase, setCurrentCase, onNext }: { t: any, curr
       {audioUrl && !isRecording && (
         <div className="w-full space-y-8 animate-in fade-in slide-in-from-bottom-4">
           <audio src={audioUrl} controls className="w-full h-12 rounded-lg" />
+          <div className="space-y-4">
+            <p className="font-semibold">{t.transcriptLabel}:</p>
+            <textarea
+              rows={4}
+              value={transcript}
+              onChange={(e) => setTranscript(e.target.value)}
+              className="w-full bg-black/20 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-gold/50"
+            />
+          </div>
           <div className="flex gap-4">
             <button 
-              onClick={() => { setAudioUrl(null); setTimer(0); }}
+              onClick={() => { setAudioUrl(null); setTimer(0); setTranscript(''); }}
               className="flex-1 py-4 border border-white/10 rounded-xl hover:bg-white/5 transition-colors flex items-center justify-center gap-2"
             >
               <Trash2 size={20} /> {t.reRecord}
@@ -575,7 +698,6 @@ function RecordScreen({ t, currentCase, setCurrentCase, onNext }: { t: any, curr
           </div>
         </div>
       )}
-
       <div className="mt-12 p-4 bg-white/5 rounded-xl border border-white/10 flex gap-3 text-left">
         <Shield className="text-gold shrink-0" size={20} />
         <p className="text-xs text-white/60 leading-relaxed">
@@ -775,8 +897,12 @@ function ComplaintScreen({ t, currentCase, setCurrentCase, onSave }: { t: any, c
             <label className="text-sm font-bold text-white/60 uppercase tracking-widest">{t.describeIncident}</label>
             <textarea 
               rows={6}
-              value={currentCase.description || ''}
-              onChange={(e) => setCurrentCase({ ...currentCase, description: e.target.value })}
+              value={currentCase.description || currentCase.transcript || ''}
+              onChange={(e) => {
+                const desc = e.target.value;
+                const inferred = inferFieldsFromText(desc);
+                setCurrentCase({ ...currentCase, description: desc, ...inferred });
+              }}
               className="w-full bg-white/5 border border-white/10 rounded-xl p-4 focus:outline-none focus:border-gold/50 transition-colors"
               placeholder="Provide as much detail as possible: who, what, where, when..."
             />
